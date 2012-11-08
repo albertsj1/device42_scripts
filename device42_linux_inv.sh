@@ -4,7 +4,7 @@
 #
 # Author: John Alberts
 # Creation Date: Oct 29, 2012
-# Last Modified: Nov 5, 2012
+# Last Modified: Nov 8, 2012
 #
 # Description: Detects hardware and some custom info and sends
 # it to a device42 server.
@@ -15,28 +15,30 @@
 # Changelog:
 # v1.0 - 11/05/2012 (John Alberts) - Initial release
 # v1.0.1 - 11/07/2012 (John Alberts) - Some error handling
+# v1.0.2 - 11/08/2012 (John Alberts) - Don't send serial or hardware
+#  for virtual guests. Cleaner RAM totals.
 #
 ############################################################
 
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 DEBUG=true
 
 ### Edit lines below
 ### Begin Custom
-USER="user"
-PASS="password"
-D42SERVER="https://your_device42_server_here"
+USER="changeme"
+PASS="changeme"
+D42SERVER="changeme"
 ##############################################
 # Used for sending email when errors occur
 MAIL="$(which sendmail)"
-TO="you@email.com"
+TO="john.alberts@mydomain.com"
 SUBJECT="[DEVICE42 ERROR] -"
 EMAIL="TO:${TO}
 FROM:device42_inventory_script@noreply.com
 "
 ##############################################
-DNAMEFILTER="s/\.domain\.\(com\|int\)//g"
+DNAMEFILTER="s/\.mydomain\.\(com\|int\)//g"
 
 ### End Custom
 
@@ -53,7 +55,7 @@ function email_error() {
   # $1 = Error exit status
   # $2 = Message
 
-  SUBJECT="${SUBJECT} Exit Status: ${1}"
+  SUBJECT="${SUBJECT}: Host:$(hostname -s), Exit Status: ${1}"
   EMAIL="SUBJECT: ${SUBJECT}\n${EMAIL}\n${2}"
   echo -e "${EMAIL}" | ${MAIL} -t
 }
@@ -93,6 +95,7 @@ function post_data() {
   fi
   thisdata="$(echo -ne "${1}" | sed 's/:/%3A/g')"
   [[ $DEBUG ]] && echo "Sending: ${2}${thisdata}"
+  #echo "curl -k -i -X ${REQ}  --data \"${thisdata}\" -u \"${USER}:${PASS}\" \"${2}\""
   STATUS="$(curl -k -i -X ${REQ}  --data "${thisdata}" -u "${USER}:${PASS}" "${2}" 2>&1)"
   if ! echo "${STATUS}" | grep '"code": 0' 2>&1 >/dev/null; then
     echo "Failed to send the following data to the server"
@@ -115,6 +118,7 @@ fi
 DATA="name=${DNAME}"
 
 # Get Total RAM
+# This complicated set of lines ends up getting us a nice round number for RAM
 MEMORY_TOTAL="$(( $(sed -n -s 's/^MemTotal:\s\+\([0-9]\+\) .*$/\1/p' /proc/meminfo) / 1024 ))"
 if [[ $MEMORY_TOTAL -lt 512 ]]; then
   x=128
@@ -127,7 +131,7 @@ elif [[ $MEMORY_TOTAL -lt 8192 ]]; then
 else
   x=2048
 fi
-MT=$(( $x * ( $MEMORY_TOTAL / $x ) ))
+MT="$(( $(echo "$(sed -n -s 's/^MemTotal:\s\+\([0-9]\+\) .*$/\1/p' /proc/meminfo) $(( $x * $x ))" | awk '{print int( ($1/$2) + 1 )}') * $x ))"
 add_data "memory=${MT}"
 
 # Get OS
@@ -176,9 +180,10 @@ fi
 
 if [[ "${IS_VSERVER_GUEST}" == "no" ]]; then
   if [[ "${DMIDECODE}" != "" ]]; then
-    SERIAL="$(${DMIDECODE} -s system-serial-number)"
-    PRODUCTNAME="$(${DMIDECODE} -s system-product-name)"
-    MANUFACTURER="$(${DMIDECODE} -s system-manufacturer)"
+    DMIOUTPUT="$(${DMIDECODE})" # not using -s option to dmidecode since it doesn't work on RHEL4
+    SERIAL="$(echo -e "${DMIOUTPUT}" | sed -n '0,/\s\+Serial Number:\s\+\(.*\)\s*/s//\1/p')"
+    PRODUCTNAME="$(echo -e "${DMIOUTPUT}" | sed -n '0,/\s\+Product Name:\s\+\(.*\)\s*/s//\1/p')"
+    MANUFACTURER="$(echo -e "${DMIOUTPUT}" | sed -n '0,/\s\+Manufacturer:\s\+\(.*\)\s*/s//\1/p')"
     case "${PRODUCTNAME}" in
       "VMware, Inc."|Bochs|KVM|QEMU|"Microsoft Corporation"|Xen)
       MANUFACTURER="vmware"
@@ -186,9 +191,9 @@ if [[ "${IS_VSERVER_GUEST}" == "no" ]]; then
       IS_VIRTUAL_GUEST="yes"
       ;;
     esac
-    CPUSPEEDMHZ="$(${DMIDECODE} -t processor | sed -n 's/^\s\+Max Speed:\s\+\([0-9]\+\).*$/\1/p' | head -n1)"
-    CPUCORES="$(${DMIDECODE} -t processor | sed -n 's/^\s\+Core Count:\s\+\([0-9]\+\).*$/\1/p' | head -n1)"
-    CPUCOUNT="$(${DMIDECODE} -t processor | grep 'Socket Designation' | wc -l)"
+    CPUSPEEDMHZ="$(echo -e "${DMIOUTPUT}" | sed -n '0,/^\s\+Max Speed:\s\+\([0-9]\+\).*$/s//\1/p')"
+    CPUCORES="$(echo -e "${DMIOUTPUT}" | sed -n '0,/^\s\+Core Count:\s\+\([0-9]\+\).*$/s//\1/p')"
+    CPUCOUNT="$(echo -e "${DMIOUTPUT}" | grep 'Socket Designation' | wc -l)"
   else
     echo "dmidecode is not installed."
     echo "some hardware information will not be collected"
@@ -206,14 +211,17 @@ if [[ "${IS_VIRTUAL_GUEST}" == "yes" || "${IS_VSERVER_GUEST}" == "yes" ]]; then
   TYPE="virtual"
   SERIAL="virtual"
   [[ ${PRODUCTNAME} ]] || PRODUCTNAME="virtual"
-  [[ ${MANUFACTURER} ]] || MANUFACTURER="virtual"
+  [[ ${MANUFACTURER} ]] || MANUFACTURER="vmware"
 else
   TYPE="physical"
 fi
 
-add_data "manufacturer=${MANUFACTURER%% *}&serial_no=${SERIAL%% *}&hardware=${PRODUCTNAME%% *}&cpucount=${CPUCOUNT:-1}&cpupower=${CPUSPEEDMHZ%%.*}&cpucore=${CPUCORES:-1}&type=${TYPE}"
+add_data "manufacturer=${MANUFACTURER%% *}&cpucount=${CPUCOUNT:-1}&cpupower=${CPUSPEEDMHZ%%.*}&cpucore=${CPUCORES:-1}&type=${TYPE}"
 if [[ "${IS_VIRTUAL_HOST}" == "yes" ]]; then
   add_data "is_it_virtual_host=yes"
+fi
+if [[ "${IS_VIRTUAL_GUEST}" == "no" ]]; then
+  add_data "hardware=${PRODUCTNAME%% *}&serial_no=${SERIAL%% *}"
 fi
 
 [[ ${VIRTUAL_HOST} ]] && add_data "virtual_host=${VIRTUAL_HOST}"
