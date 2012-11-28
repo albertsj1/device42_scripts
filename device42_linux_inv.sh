@@ -4,7 +4,7 @@
 #
 # Author: John Alberts
 # Creation Date: Oct 29, 2012
-# Last Modified: Nov 8, 2012
+# Last Modified: Nov 28, 2012
 #
 # Description: Detects hardware and some custom info and sends
 # it to a device42 server.
@@ -17,12 +17,15 @@
 # v1.0.1 - 11/07/2012 (John Alberts) - Some error handling
 # v1.0.2 - 11/08/2012 (John Alberts) - Don't send serial or hardware
 #  for virtual guests. Cleaner RAM totals.
+# v1.0.3 - 11/27/2012 (John alberts) - Fix trap handler, add customer info,
+#  assign customer to device.
+# v1.0.4 - Better vserver detection
 #
 ############################################################
 
 
-VERSION="1.0.2"
-DEBUG=true
+VERSION="1.0.4"
+DEBUG=
 
 ### Edit lines below
 ### Begin Custom
@@ -48,13 +51,15 @@ DEVICEURL="${D42SERVER}/api/device/"
 IPURL="${D42SERVER}/api/ip/"
 CFURL="${D42SERVER}/api/1.0/device/custom_field/"
 MACURL="${D42SERVER}/api/1.0/macs/"
-
+CUSTOMERURL="${D42SERVER}/api/1.0/customers/"
+CUSTOMERCFURL="${D42SERVER}/api/1.0/custom_fields/customer/id/"
 
 
 function email_error() {
   # $1 = Error exit status
   # $2 = Message
 
+  echo -e "There was an error:\n${2}"
   SUBJECT="${SUBJECT}: Host:$(hostname -s), Exit Status: ${1}"
   EMAIL="SUBJECT: ${SUBJECT}\n${EMAIL}\n${2}"
   echo -e "${EMAIL}" | ${MAIL} -t
@@ -66,13 +71,14 @@ function my_trap_handler() {
   MYSELF="$0"               # equals to my script name
   LASTLINE="$1"            # argument 1: last line of error occurence
   LASTERR="$2"             # argument 2: error code of last command
-  echo "script error encountered at `date` in ${MYSELF}: line ${LASTLINE}: exit status of last command: ${LASTERR}"
+  MSG="script error encountered at $(date) in ${MYSELF}: line ${LASTLINE}: exit status of last command: ${LASTERR}"
+  echo $MSG
 
   # do additional processing: send email or SNMP trap, write result to database, etc.
-  email_error "${LASTERR}" "${LASTLINE}"
+  email_error "${LASTERR}" "${MSG}"
 }
 
-trap 'my_trap_handler ${LINENO} $?' 1 3 5 15
+trap 'my_trap_handler ${LINENO} $?' ERR #1 3 5 15
 
 DATA=""
 
@@ -88,15 +94,16 @@ function post_data() {
 # expects a data string to be passed as the 1st parameter.
   # $1 = data to send
   # $2 = URL to send to
-  if echo "${2}" | grep '/custom_field/' 2>&1 >/dev/null; then
+  if echo "${2}" | egrep '\/custom_fields?\/' 2>&1 >/dev/null; then
     REQ="PUT"
   else
     REQ="POST"
   fi
   thisdata="$(echo -ne "${1}" | sed 's/:/%3A/g')"
   [[ $DEBUG ]] && echo "Sending: ${2}${thisdata}"
-  #echo "curl -k -i -X ${REQ}  --data \"${thisdata}\" -u \"${USER}:${PASS}\" \"${2}\""
-  STATUS="$(curl -k -i -X ${REQ}  --data "${thisdata}" -u "${USER}:${PASS}" "${2}" 2>&1)"
+  [[ $DEBUG ]] && echo "curl -k -i -X ${REQ}  --data \"${thisdata}\" -u \"${USER}:${PASS}\" \"${2}\""
+  set +e
+  STATUS="$(curl -k -X ${REQ}  --data "${thisdata}" -u "${USER}:${PASS}" "${2}" 2>&1)"
   if ! echo "${STATUS}" | grep '"code": 0' 2>&1 >/dev/null; then
     echo "Failed to send the following data to the server"
     echo "${thisdata}"
@@ -106,6 +113,7 @@ function post_data() {
     exit 1
   fi
   [[ $DEBUG ]] && echo -e "Sent Data: ${2}${thisdata}\n"
+  set -e
 }
 
 
@@ -152,10 +160,13 @@ IS_VIRTUAL_HOST=no
 IS_VIRTUAL_GUEST=no
 VIRTUAL_HOST=
 DMIDECODE="$(which dmidecode 2>/dev/null)"
-if [[ -e /proc/virtual ]]; then
+vxid=$(sed -n 's/VxID:\s\+\([0-9]\+\)$/\1/p' /proc/self/status)
+[[ "${vxid}" == "" ]] && vxid=0
+
+if [[ $vxid -eq 0 ]]; then
   VIRTUAL="VServer host"
   IS_VIRTUAL_HOST="yes"
-elif [[ ! -e /proc/virtual && ! -e /dev/mem ]]; then
+elif [[ $vxid -gt 0 ]]; then
   VIRTUAL="VServer guest"
   IS_VIRTUAL_GUEST="yes"
   IS_VSERVER_GUEST="yes"
@@ -233,7 +244,6 @@ post_data "${DATA}" "${DEVICEURL}"
 
 # Now, send the nic info
 # First, we need to get the device number for this server
-
 DATA=""
 NICS="$(ifconfig | egrep -A1 '^[a-zA-Z]')"
 OLDIFS="${IFS}"
@@ -265,6 +275,7 @@ for thisline in ${NICS}; do
   fi
 done
 
+echo "Sending custom fields"
 # Set custom fields
 DATA=""
 DATA="name=${DNAME}&key=test&value=test_value"
@@ -275,6 +286,46 @@ for thiscf in ${CF}; do
   post_data "name=${DNAME}&key=${thiskey}&value=${thisvalue:-none}" "${CFURL}"
 done
 
+function get_customer_id() {
+  # $1 is customer name
+  # | sed 's/},\s*{/}\n{/g' | sed -n 's/.*University of Adelaide.*id\":\s*\([0-9]\+\),.*$/\1/p'
+  [[ $DEBUG ]] && echo "Trying to retrieve ID for customer: $1" >&2
+  cid="$(curl -s -k -X GET -H "Accept: application/json" -u "${USER}:${PASS}" "${CUSTOMERURL}" | sed 's/},\s*{/}\n{/g' | sed -n "s/.*\"${1}\",.*id\":\s*\([0-9]\+\),.*$/\1/p")"
+  [[ $DEBUG ]] && echo "curl returned: $cid" >&2
+  echo -n $cid
+}
+
+echo "Sending customer information"
+# Set customer information
+CN="$(sed -n 's/cCustomerName:\(.*\)$/\1/p' /etc/.exlhs/.server_info.txt | cut -c 1-30)"
+if [[ "${CN}" != "" ]]; then
+  CID="$(get_customer_id $CN)"
+  [[ $DEBUG ]] && echo "Got customer ID: $CID"
+  # TODO: if CID isn't found, create new customer
+  if [[ "${CID}" == "" ]]; then
+    DATA="name=${CN}"
+    post_data "${DATA}" "${CUSTOMERURL}"
+    CID="$(get_customer_id $CN)"
+    [[ $DEBUG ]] && echo "Got customer ID: $CID after creating new customer entry"
+  fi
+  if [[ "${CID}" == "" ]]; then
+    echo "Failed to create new customer and get customer id"
+    exit
+  fi
+  CC="$(sed -n 's/cCustomerCode:\(.*\)$/\1/p' /etc/.exlhs/.server_info.txt)"
+  if [[ "${CC}" != "" ]]; then
+    DATA="key=Customer Code&value=${CC}"
+    post_data "${DATA}" "${CUSTOMERCFURL}${CID}/"
+  fi
+  # Associate this server with this customer
+
+fi
 IFS="${OLDIFS}"
 
+# Assign this device to a customer if we got a valid $CID and $CN
+if [[ "$CID" != "" && "${CN}" != "" ]]; then
+  echo "Setting device customer name"
+  DATA="name=${DNAME}&customer=${CN}"
+  post_data "${DATA}" "${DEVICEURL}"
+fi
 exit 0
